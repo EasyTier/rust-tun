@@ -30,6 +30,7 @@ use crate::error::*;
 pub struct Device {
     queue: Queue,
     mtu: usize,
+    name: String,
 }
 
 impl Device {
@@ -37,19 +38,19 @@ impl Device {
     pub fn new(config: &Configuration) -> Result<Self> {
         let wintun = unsafe { wintun::load()? };
         let tun_name = config.name.as_deref().unwrap_or("wintun");
-        let guid = Some(9099482345783245345345_u128);
+        let guid = config.platform.guid;
         let adapter = match wintun::Adapter::open(&wintun, tun_name) {
             Ok(a) => a,
             Err(_) => wintun::Adapter::create(&wintun, tun_name, tun_name, guid)?,
         };
 
-        let address = config.address.unwrap_or(Ipv4Addr::new(10, 1, 0, 2));
-        let mask = config.netmask.unwrap_or(Ipv4Addr::new(255, 255, 255, 0));
-        let gateway = config.destination.map(IpAddr::from);
-        adapter.set_network_addresses_tuple(IpAddr::V4(address), IpAddr::V4(mask), gateway)?;
         let mtu = config.mtu.unwrap_or(1500) as usize;
-
-        let session = adapter.start_session(wintun::MAX_RING_CAPACITY)?;
+        let session = adapter.start_session(
+            config
+                .platform
+                .ring_cap
+                .unwrap_or(wintun::MAX_RING_CAPACITY),
+        )?;
 
         let mut device = Device {
             queue: Queue {
@@ -57,7 +58,18 @@ impl Device {
                 cached: Arc::new(Mutex::new(Vec::with_capacity(mtu))),
             },
             mtu,
+            name: tun_name.to_string(),
         };
+
+        // on win7 guid will not be correctly assigned, user should skip the config step.
+        if config.platform.skip_config || adapter.get_name().is_err() {
+            return Ok(device);
+        }
+
+        let address = config.address.unwrap_or(Ipv4Addr::new(10, 1, 0, 2));
+        let mask = config.netmask.unwrap_or(Ipv4Addr::new(255, 255, 255, 0));
+        let gateway = config.destination.map(IpAddr::from);
+        adapter.set_network_addresses_tuple(IpAddr::V4(address), IpAddr::V4(mask), gateway)?;
 
         // This is not needed since we use netsh to set the address.
         device.configure(config)?;
@@ -102,11 +114,15 @@ impl D for Device {
     type Queue = Queue;
 
     fn name(&self) -> Result<String> {
-        Ok(self.queue.session.get_adapter().get_name()?)
+        match self.queue.session.get_adapter().get_name() {
+            Ok(name) => Ok(name),
+            Err(_) => Ok(self.name.clone()),
+        }
     }
 
     fn set_name(&mut self, value: &str) -> Result<()> {
         self.queue.session.get_adapter().set_name(value)?;
+        self.name = value.to_string();
         Ok(())
     }
 

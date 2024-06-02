@@ -23,11 +23,35 @@ use crate::error::*;
 
 /// Windows-only interface configuration.
 #[derive(Copy, Clone, Default, Debug)]
-pub struct Configuration {}
+pub struct Configuration {
+    skip_config: bool,
+    guid: Option<u128>,
+    ring_cap: Option<u32>,
+}
 
 impl Configuration {
     pub fn initialize(&mut self) {
         log::trace!("Windows configuration initialize");
+    }
+
+    pub fn skip_config(&mut self, skip_config: bool) {
+        self.skip_config = skip_config;
+    }
+
+    pub fn guid(&mut self, guid: Option<u128>) {
+        self.guid = guid;
+    }
+
+    pub fn min_ring_cap(&self) -> u32 {
+        wintun::MIN_RING_CAPACITY
+    }
+
+    pub fn max_ring_cap(&self) -> u32 {
+        wintun::MAX_RING_CAPACITY
+    }
+
+    pub fn ring_cap(&mut self, ring_cap: Option<u32>) {
+        self.ring_cap = ring_cap;
     }
 }
 
