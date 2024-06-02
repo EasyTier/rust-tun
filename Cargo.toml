@@ -1,13 +1,13 @@
 [package]
-name = "tun"
+name = "tun-easytier"
 version = "0.6.1"
 edition = "2021"
 
-authors = ["meh. <meh@schizofreni.co>"]
+authors = ["meh. <meh@schizofreni.co>", "sijie.sun <sunsijie@buaa.edu.cn>"]
 license = "WTFPL"
 
-description = "TUN device creation and handling."
-repository = "https://github.com/meh/rust-tun"
+description = "TUN device creation and handling. modified for easytier."
+repository = "https://github.com/EasyTier/rust-tun"
 keywords = ["tun", "network", "tunnel", "bindings"]
 
 [dependencies]
