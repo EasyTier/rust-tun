@@ -12,22 +12,19 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
-use core::pin::Pin;
-use core::task::{Context, Poll};
-use futures_core::ready;
-use std::io::{IoSlice, Read, Write};
+use crate::AsyncRead;
+use crate::AsyncWrite;
+use std::io::{self, IoSlice, IoSliceMut};
+use std::task::ready;
+use std::task::Context;
+use std::task::Poll;
 use tokio::io::unix::AsyncFd;
-use tokio::io::Interest;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio_util::codec::Framed;
 
-use super::TunPacketCodec;
-use crate::device::AbstractDevice;
 use crate::platform::Device;
 
 /// An async TUN device wrapper around a TUN device.
 pub struct AsyncDevice {
-    inner: AsyncFd<Device>,
+    device: AsyncFd<Device>,
 }
 
 /// Returns a shared reference to the underlying Device object.
@@ -35,14 +32,14 @@ impl core::ops::Deref for AsyncDevice {
     type Target = Device;
 
     fn deref(&self) -> &Self::Target {
-        self.inner.get_ref()
+        self.device.get_ref()
     }
 }
 
 /// Returns a mutable reference to the underlying Device object.
 impl core::ops::DerefMut for AsyncDevice {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.inner.get_mut()
+        self.device.get_mut()
     }
 }
 
@@ -51,98 +48,88 @@ impl AsyncDevice {
     pub fn new(device: Device) -> std::io::Result<AsyncDevice> {
         device.set_nonblock()?;
         Ok(AsyncDevice {
-            inner: AsyncFd::new(device)?,
+            device: AsyncFd::new(device)?,
         })
     }
 
-    /// Consumes this AsyncDevice and return a Framed object (unified Stream and Sink interface)
-    pub fn into_framed(self) -> Framed<Self, TunPacketCodec> {
-        let mtu = self.mtu().unwrap_or(crate::DEFAULT_MTU);
-        let codec = TunPacketCodec::new(mtu as usize);
-        // associate mtu with the capacity of ReadBuf
-        Framed::with_capacity(self, codec, mtu as usize)
-    }
-
-    /// Recv a packet from tun device
-    pub async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let guard = self.inner.readable().await?;
-        guard
-            .get_ref()
-            .async_io(Interest::READABLE, |inner| inner.recv(buf))
-            .await
-    }
-
-    /// Send a packet to tun device
-    pub async fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        let guard = self.inner.writable().await?;
-        guard
-            .get_ref()
-            .async_io(Interest::WRITABLE, |inner| inner.send(buf))
-            .await
+    pub fn split(self) -> (AsyncReader, AsyncWriter) {
+        let device = std::sync::Arc::new(self.device);
+        (
+            AsyncReader::new(device.clone()),
+            AsyncWriter::new(device.clone()),
+        )
     }
 }
 
-impl AsyncRead for AsyncDevice {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf,
-    ) -> Poll<std::io::Result<()>> {
+pub struct AsyncReader {
+    device: std::sync::Arc<AsyncFd<Device>>,
+}
+
+impl AsyncReader {
+    fn new(device: std::sync::Arc<AsyncFd<Device>>) -> Self {
+        Self { device }
+    }
+}
+
+impl AsyncRead for AsyncReader {
+    fn poll_read(&mut self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         loop {
-            let mut guard = ready!(self.inner.poll_read_ready_mut(cx))?;
-            let rbuf = buf.initialize_unfilled();
-            match guard.try_io(|inner| inner.get_mut().read(rbuf)) {
-                Ok(res) => return Poll::Ready(res.map(|n| buf.advance(n))),
-                Err(_wb) => continue,
+            let mut guard = ready!(self.device.poll_read_ready(cx))?;
+            match guard.try_io(|device| device.get_ref().recv(buf)) {
+                Ok(r) => return Poll::Ready(r),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn poll_read_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            let mut guard = ready!(self.device.poll_read_ready(cx))?;
+            match guard.try_io(|device| device.get_ref().recv_vectored(bufs)) {
+                Ok(r) => return Poll::Ready(r),
+                Err(_) => continue,
             }
         }
     }
 }
 
-impl AsyncWrite for AsyncDevice {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
+#[derive(Clone)]
+pub struct AsyncWriter {
+    device: std::sync::Arc<AsyncFd<Device>>,
+}
+
+impl AsyncWriter {
+    fn new(device: std::sync::Arc<AsyncFd<Device>>) -> Self {
+        Self { device }
+    }
+}
+
+impl AsyncWrite for AsyncWriter {
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<()>> {
         loop {
-            let mut guard = ready!(self.inner.poll_write_ready_mut(cx))?;
-            match guard.try_io(|inner| inner.get_mut().write(buf)) {
-                Ok(res) => return Poll::Ready(res),
-                Err(_wb) => continue,
+            let mut guard = ready!(self.device.poll_write_ready(cx))?;
+            match guard.try_io(|device| device.get_ref().send(buf)) {
+                Ok(r) => return Poll::Ready(r),
+                Err(_) => continue,
             }
         }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_write_ready_mut(cx))?;
-            match guard.try_io(|inner| inner.get_mut().flush()) {
-                Ok(res) => return Poll::Ready(res),
-                Err(_wb) => continue,
-            }
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
     }
 
     fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
+        &mut self,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
-    ) -> Poll<std::io::Result<usize>> {
+    ) -> Poll<io::Result<()>> {
         loop {
-            let mut guard = ready!(self.inner.poll_write_ready_mut(cx))?;
-            match guard.try_io(|inner| inner.get_mut().write_vectored(bufs)) {
-                Ok(res) => return Poll::Ready(res),
-                Err(_wb) => continue,
+            let mut guard = ready!(self.device.poll_write_ready(cx))?;
+            match guard.try_io(|device| device.get_ref().send_vectored(bufs)) {
+                Ok(r) => return Poll::Ready(r),
+                Err(_) => continue,
             }
         }
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        true
     }
 }

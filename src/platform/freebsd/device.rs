@@ -12,11 +12,11 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
+use derive_more::{Deref, DerefMut};
 use libc::{
     self, c_char, c_short, ifreq, AF_INET, IFF_RUNNING, IFF_UP, IFNAMSIZ, O_RDWR, SOCK_DGRAM,
 };
 use std::{
-    // ffi::{CStr, CString},
     io::{self, Read, Write},
     mem,
     net::{IpAddr, Ipv4Addr},
@@ -40,8 +40,11 @@ struct Route {
 }
 
 /// A TUN device using the TUN/TAP Linux driver.
+#[derive(Deref, DerefMut)]
 pub struct Device {
     tun_name: String,
+    #[deref]
+    #[deref_mut]
     tun: Tun,
     ctl: Fd,
     route: Option<Route>,
@@ -203,11 +206,6 @@ impl Device {
         (self.tun.reader, self.tun.writer)
     }
 
-    /// Set non-blocking mode
-    pub fn set_nonblock(&self) -> io::Result<()> {
-        self.tun.set_nonblock()
-    }
-
     fn set_route(&mut self, route: Route) -> Result<()> {
         // if let Some(v) = &self.route {
         //     let prefix_len = ipnet::ip_mask_to_prefix(IpAddr::V4(v.netmask))
@@ -242,16 +240,6 @@ impl Device {
         log::info!("route {}", args.join(" "));
         self.route = Some(route);
         Ok(())
-    }
-
-    /// Recv a packet from tun device
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.tun.recv(buf)
-    }
-
-    /// Send a packet to tun device
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.tun.send(buf)
     }
 }
 

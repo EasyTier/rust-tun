@@ -19,6 +19,7 @@ use crate::{
     error::{Error, Result},
     platform::posix::{self, Fd, Tun},
 };
+use derive_more::{Deref, DerefMut};
 use std::{
     io::{Read, Write},
     net::IpAddr,
@@ -26,7 +27,10 @@ use std::{
 };
 
 /// A TUN device for iOS.
+#[derive(Deref, DerefMut)]
 pub struct Device {
+    #[deref]
+    #[deref_mut]
     tun: Tun,
 }
 
@@ -64,21 +68,6 @@ impl Device {
     /// Split the interface into a `Reader` and `Writer`.
     pub fn split(self) -> (posix::Reader, posix::Writer) {
         (self.tun.reader, self.tun.writer)
-    }
-
-    /// Set non-blocking mode
-    pub fn set_nonblock(&self) -> std::io::Result<()> {
-        self.tun.set_nonblock()
-    }
-
-    /// Recv a packet from tun device
-    pub fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.tun.recv(buf)
-    }
-
-    /// Send a packet to tun device
-    pub fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
-        self.tun.send(buf)
     }
 }
 

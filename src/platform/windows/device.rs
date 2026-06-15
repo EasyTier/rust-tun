@@ -12,10 +12,11 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
-use std::io::{self, Read, Write};
+use derive_more::{Deref, DerefMut};
+use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-
+use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_HANDLE_EOF};
 use wintun::Session;
 
 use crate::configuration::Configuration;
@@ -24,9 +25,13 @@ use crate::error::{Error, Result};
 use crate::platform::windows::verify_dll_file::{
     get_dll_absolute_path, get_signer_name, verify_embedded_signature,
 };
+use crate::utils::{DataExt, SliceExt};
 
 /// A TUN device using the wintun driver.
+#[derive(Deref, DerefMut)]
 pub struct Device {
+    #[deref]
+    #[deref_mut]
     pub(crate) tun: Tun,
     mtu: u16,
     name: String,
@@ -64,8 +69,7 @@ impl Device {
             let mask = config
                 .netmask
                 .unwrap_or(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0)));
-            let gateway = config.destination.map(IpAddr::from);
-            adapter.set_network_addresses_tuple(address, mask, gateway)?;
+            adapter.set_network_addresses_tuple(address, mask, config.destination)?;
             #[cfg(feature = "wintun-dns")]
             if let Some(dns_servers) = &config.platform_config.dns_servers {
                 adapter.set_dns_servers(dns_servers)?;
@@ -99,17 +103,7 @@ impl Device {
 
     pub fn split(self) -> (Reader, Writer) {
         let tun = Arc::new(self.tun);
-        (Reader(tun.clone()), Writer(tun))
-    }
-
-    /// Recv a packet from tun device
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.tun.recv(buf)
-    }
-
-    /// Send a packet to tun device
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.tun.send(buf)
+        (Reader(tun.clone()), Writer(tun.clone()))
     }
 }
 
@@ -122,6 +116,10 @@ impl Read for Device {
 impl Write for Device {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.tun.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.tun.write_vectored(bufs)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -250,52 +248,81 @@ pub struct Tun {
 }
 
 impl Tun {
-    pub fn get_session(&self) -> Arc<Session> {
+    pub fn session(&self) -> Arc<Session> {
         self.session.clone()
     }
-    fn read_by_ref(&self, mut buf: &mut [u8]) -> io::Result<usize> {
+
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self.session.receive_blocking() {
-            Ok(pkt) => match io::copy(&mut pkt.bytes(), &mut buf) {
-                Ok(n) => Ok(n as usize),
-                Err(e) => Err(e),
-            },
+            Ok(data) => Ok(data.bytes().put(buf)),
             Err(e) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, e)),
         }
     }
-    fn write_by_ref(&self, mut buf: &[u8]) -> io::Result<usize> {
-        let size = buf.len();
-        match self.session.allocate_send_packet(size as u16) {
-            Err(e) => Err(io::Error::new(io::ErrorKind::OutOfMemory, e)),
-            Ok(mut packet) => match io::copy(&mut buf, &mut packet.bytes_mut()) {
-                Ok(s) => {
-                    self.session.send_packet(packet);
-                    Ok(s as usize)
-                }
-                Err(e) => Err(e),
-            },
+
+    pub fn recv_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        match self.session.receive_blocking() {
+            Ok(data) => Ok(data.bytes().putv(bufs)),
+            Err(e) => Err(io::Error::new(io::ErrorKind::ConnectionAborted, e)),
         }
     }
 
-    /// Recv a packet from tun device
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_by_ref(buf)
+    fn with_packet(&self, size: usize, f: impl FnOnce(wintun::Packet)) -> io::Result<()> {
+        match self.session.allocate_send_packet(size as u16) {
+            Ok(packet) => {
+                f(packet);
+                Ok(())
+            }
+            Err(wintun::Error::Io(e)) => match e.raw_os_error() {
+                Some(code) if code == ERROR_BUFFER_OVERFLOW as i32 => Ok(()),
+                Some(code) if code == ERROR_HANDLE_EOF as i32 => {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, e))
+                }
+                _ => Err(e),
+            },
+            Err(e) => Err(io::Error::other(e)),
+        }
     }
 
-    /// Send a packet to tun device
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.write_by_ref(buf)
+    pub fn send(&self, buf: &[u8]) -> io::Result<()> {
+        self.with_packet(buf.len(), |mut packet| {
+            packet.bytes_mut().copy_from_slice(buf);
+            self.session.send_packet(packet);
+        })
+    }
+
+    pub fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<()> {
+        let size = bufs.size();
+        if size == 0 {
+            return Ok(());
+        }
+        self.with_packet(size, |mut packet| {
+            let dst = packet.bytes_mut();
+            let mut offset = 0;
+            for buf in bufs {
+                if !buf.is_empty() {
+                    let end = offset + buf.len();
+                    dst[offset..end].copy_from_slice(buf);
+                    offset = end;
+                }
+            }
+            self.session.send_packet(packet);
+        })
     }
 }
 
 impl Read for Tun {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.read_by_ref(buf)
+        self.recv(buf)
     }
 }
 
 impl Write for Tun {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.write_by_ref(buf)
+        self.send(buf).map(|_| buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.send_vectored(bufs).map(|_| bufs.size())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -316,7 +343,7 @@ pub struct Reader(Arc<Tun>);
 
 impl Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read_by_ref(buf)
+        self.0.recv(buf)
     }
 }
 
@@ -325,7 +352,11 @@ pub struct Writer(Arc<Tun>);
 
 impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write_by_ref(buf)
+        self.0.send(buf).map(|_| buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.0.send_vectored(bufs).map(|_| bufs.size())
     }
 
     fn flush(&mut self) -> io::Result<()> {

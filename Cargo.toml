@@ -7,14 +7,17 @@ license = "WTFPL"
 description = "TUN device creation and handling."
 repository = "https://github.com/EasyTier/rust-tun"
 keywords = ["tun", "network", "tunnel", "bindings"]
-rust-version = "1.75"
+rust-version = "1.95"
 
 [lib]
 crate-type = ["staticlib", "cdylib", "lib"]
 
 [dependencies]
 bytes = { version = "1" }
+smallvec = "1.15.2"
 cfg-if = "1"
+delegate = "0.13.5"
+derive_more = { version = "2.1.1", features = ["full"] }
 futures-core = { version = "0.3", optional = true }
 libc = { version = "0.2", features = ["extra_traits"] }
 log = "0.4"
@@ -23,11 +26,17 @@ tokio = { version = "1", features = [
     "net",
     "macros",
     "io-util",
+    "time",
 ], optional = true }
-tokio-util = { version = "0.7", features = ["codec"], optional = true }
+tokio-util = { version = "0.7", features = ["codec", "io"], optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "android", target_os="freebsd"))'.dependencies]
 nix = { version = "0.29", features = ["ioctl"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+netlink-packet-core = "0.8"
+netlink-packet-route = "0.31"
+netlink-sys = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -46,7 +55,7 @@ libloading = "0.8"
 ipnet = "2"
 
 [dev-dependencies]
-ctrlc2 = { version = "3", features = ["tokio", "termination"] }
+ctrlc2 = { version = "=3.6.3", features = ["tokio", "termination"] }
 env_logger = "0.11"
 futures = "0.3"
 packet = "0.1"
@@ -55,7 +64,7 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [features]
 default = ["wintun-dns"]
-async = ["tokio", "futures-core", "tokio-util"]
+async = ["futures-core", "tokio", "tokio-util"]
 wintun-dns = []
 
 [package.metadata.docs.rs]

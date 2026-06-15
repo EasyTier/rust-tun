@@ -44,7 +44,7 @@ packets from it.
 use std::io::Read;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    let mut config = tun2::Configuration::default();
+    let mut config = tun_easytier::Configuration::default();
     config
         .address((10, 0, 0, 9))
         .netmask((255, 255, 255, 0))
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         config.ensure_root_privileges(true);
     });
 
-    let mut dev = tun2::create(&config)?;
+    let mut dev = tun_easytier::create(&config)?;
     let mut buf = [0; 4096];
 
     loop {
@@ -117,13 +117,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 pub extern "C" fn start_tun(fd: std::os::raw::c_int) {
     let mut rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        let mut cfg = tun2::Configuration::default();
+        let mut cfg = tun_easytier::Configuration::default();
         cfg.raw_fd(fd);
         #[cfg(target_os = "ios")]
         cfg.platform_config(|p_cfg| {
             p_cfg.packet_information(true);
         });
-        let mut tun = tun2::create_as_async(&cfg).unwrap();
+        let mut tun = tun_easytier::create_as_async(&cfg).unwrap();
         let mut framed = tun.into_framed();
         while let Some(packet) = framed.next().await {
             ...

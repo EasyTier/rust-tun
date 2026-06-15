@@ -25,6 +25,7 @@ use crate::{
 
 const OVERWRITE_SIZE: usize = std::mem::size_of::<libc::__c_anonymous_ifr_ifru>();
 
+use derive_more::{Deref, DerefMut};
 use libc::{
     self, c_char, c_short, c_uint, c_void, sockaddr, socklen_t, AF_INET, AF_SYSTEM, AF_SYS_CONTROL,
     IFF_RUNNING, IFF_UP, IFNAMSIZ, PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL, UTUN_OPT_IFNAME,
@@ -46,8 +47,11 @@ struct Route {
 }
 
 /// A TUN device using the TUN macOS driver.
+#[derive(Deref, DerefMut)]
 pub struct Device {
     tun_name: Option<String>,
+    #[deref]
+    #[deref_mut]
     tun: posix::Tun,
     ctl: Option<posix::Fd>,
     route: Option<Route>,
@@ -235,11 +239,6 @@ impl Device {
         (self.tun.reader, self.tun.writer)
     }
 
-    /// Set non-blocking mode
-    pub fn set_nonblock(&self) -> io::Result<()> {
-        self.tun.set_nonblock()
-    }
-
     fn set_route(&mut self, route: Route) -> Result<()> {
         if let Some(v) = &self.route {
             let prefix_len = ipnet::ip_mask_to_prefix(IpAddr::V4(v.netmask))
@@ -273,16 +272,6 @@ impl Device {
         log::info!("route {}", args.join(" "));
         self.route = Some(route);
         Ok(())
-    }
-
-    /// Recv a packet from tun device
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.tun.recv(buf)
-    }
-
-    /// Send a packet to tun device
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.tun.send(buf)
     }
 }
 
@@ -516,7 +505,7 @@ pub fn run_command(command: &str, args: &[&str]) -> std::io::Result<Vec<u8>> {
             &out.stderr
         });
         let info = format!("{} failed with: \"{}\"", command, err);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, info));
+        return Err(std::io::Error::other(info));
     }
     Ok(out.stdout)
 }

@@ -12,10 +12,9 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
-use futures::{SinkExt, StreamExt};
 use packet::{builder::Builder, icmp, ip, Packet};
 use tokio::sync::mpsc::Receiver;
-use tun2::{self, BoxError, Configuration};
+use tun_easytier::{self, AbstractDevice, AsyncReadExt, AsyncWriteExt, BoxError, Configuration};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
@@ -52,9 +51,10 @@ async fn main_entry(mut quit: Receiver<()>) -> Result<(), BoxError> {
         config.device_guid(9099482345783245345345_u128);
     });
 
-    let dev = tun2::create_as_async(&config)?;
-
-    let mut framed = dev.into_framed();
+    let dev = tun_easytier::create_as_async(&config)?;
+    let size = dev.mtu().unwrap_or(65535) as usize + tun_easytier::PACKET_INFORMATION_LENGTH;
+    let (mut reader, mut writer) = dev.split();
+    let mut buf = vec![0; size];
 
     loop {
         tokio::select! {
@@ -62,8 +62,8 @@ async fn main_entry(mut quit: Receiver<()>) -> Result<(), BoxError> {
                 println!("Quit...");
                 break;
             }
-            Some(packet) = framed.next() => {
-                let pkt: Vec<u8> = packet?;
+            len = reader.read(&mut buf) => {
+                let pkt = &buf[..len?];
                 match ip::Packet::new(pkt) {
                     Ok(ip::Packet::V4(pkt)) => {
                         if let Ok(icmp) = icmp::Packet::new(pkt.payload()) {
@@ -81,7 +81,7 @@ async fn main_entry(mut quit: Receiver<()>) -> Result<(), BoxError> {
                                     .sequence(icmp.sequence())?
                                     .payload(icmp.payload())?
                                     .build()?;
-                                framed.send(reply).await?;
+                                writer.write(&reply).await?;
                             }
                         }
                     }

@@ -12,9 +12,8 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
-use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc::Receiver;
-use tun2::{AbstractDevice, BoxError};
+use tun_easytier::{AbstractDevice, AsyncReadExt, BoxError};
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
@@ -31,13 +30,13 @@ async fn main() -> Result<(), BoxError> {
 }
 
 async fn main_entry(mut quit: Receiver<()>) -> Result<(), BoxError> {
-    let mut config = tun2::Configuration::default();
+    let mut config = tun_easytier::Configuration::default();
 
     config
         .address((10, 0, 0, 9))
         .netmask((255, 255, 255, 0))
         .destination((10, 0, 0, 1))
-        .mtu(tun2::DEFAULT_MTU)
+        .mtu(tun_easytier::DEFAULT_MTU)
         .up();
 
     #[cfg(target_os = "linux")]
@@ -45,8 +44,9 @@ async fn main_entry(mut quit: Receiver<()>) -> Result<(), BoxError> {
         config.ensure_root_privileges(true);
     });
 
-    let mut dev = tun2::create_as_async(&config)?;
-    let size = dev.mtu()? as usize + tun2::PACKET_INFORMATION_LENGTH;
+    let dev = tun_easytier::create_as_async(&config)?;
+    let size = dev.mtu()? as usize + tun_easytier::PACKET_INFORMATION_LENGTH;
+    let (mut reader, _) = dev.split();
     let mut buf = vec![0; size];
     loop {
         tokio::select! {
@@ -54,7 +54,7 @@ async fn main_entry(mut quit: Receiver<()>) -> Result<(), BoxError> {
                 println!("Quit...");
                 break;
             }
-            len = dev.read(&mut buf) => {
+            len = reader.read(&mut buf) => {
                 println!("pkt: {:?}", &buf[..len?]);
             }
         };

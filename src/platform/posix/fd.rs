@@ -13,6 +13,8 @@
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
 use crate::error::{Error, Result};
+use crate::platform::posix::fd::io::IoSlice;
+use crate::platform::posix::fd::io::IoSliceMut;
 use libc::{self, fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
 use std::io;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
@@ -43,21 +45,46 @@ impl Fd {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let fd = self.as_raw_fd();
-        let amount = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        let amount = unsafe { libc::read(self.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
         if amount < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(amount as usize)
     }
 
-    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let fd = self.as_raw_fd();
-        let amount = unsafe { libc::write(fd, buf.as_ptr() as *const _, buf.len()) };
+    pub fn readv(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        let amount = unsafe {
+            libc::readv(
+                self.as_raw_fd(),
+                bufs.as_ptr() as *const libc::iovec,
+                bufs.len().min(libc::c_int::MAX as usize) as libc::c_int,
+            )
+        };
         if amount < 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(amount as usize)
+    }
+
+    pub fn write(&self, buf: &[u8]) -> io::Result<()> {
+        if unsafe { libc::write(self.as_raw_fd(), buf.as_ptr() as *const _, buf.len()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn writev(&self, bufs: &[IoSlice<'_>]) -> io::Result<()> {
+        if unsafe {
+            libc::writev(
+                self.as_raw_fd(),
+                bufs.as_ptr() as *const libc::iovec,
+                bufs.len().min(libc::c_int::MAX as usize) as libc::c_int,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 }
 

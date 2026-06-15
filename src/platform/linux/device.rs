@@ -12,10 +12,19 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
+use derive_more::{Deref, DerefMut};
 use libc::{
-    self, c_char, c_short, ifreq, AF_INET, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_RUNNING, IFF_TAP,
-    IFF_TUN, IFF_UP, IFNAMSIZ, O_RDWR, SOCK_DGRAM,
+    self, c_char, c_short, ifreq, AF_INET, IFF_MULTI_QUEUE, IFF_NAPI, IFF_NO_PI, IFF_RUNNING,
+    IFF_TAP, IFF_TUN, IFF_UP, IFF_VNET_HDR, IFNAMSIZ, O_RDWR, SOCK_DGRAM,
 };
+use netlink_packet_core::{
+    NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST,
+};
+use netlink_packet_route::{
+    tc::{TcAttribute, TcMessage},
+    RouteNetlinkMessage,
+};
+use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 use std::{
     ffi::{CStr, CString},
     io::{self, Read, Write},
@@ -24,6 +33,8 @@ use std::{
     os::unix::io::{AsRawFd, IntoRawFd, RawFd},
     ptr,
 };
+
+const TC_H_ROOT: u32 = 0xFFFF_FFFF;
 
 use crate::{
     configuration::{Configuration, Layer},
@@ -36,8 +47,11 @@ use crate::{
 const OVERWRITE_SIZE: usize = std::mem::size_of::<libc::__c_anonymous_ifr_ifru>();
 
 /// A TUN device using the TUN/TAP Linux driver.
+#[derive(Deref, DerefMut)]
 pub struct Device {
     tun_name: String,
+    #[deref]
+    #[deref_mut]
     tun: Tun,
     ctl: Fd,
 }
@@ -95,13 +109,19 @@ impl Device {
 
             let iff_no_pi = IFF_NO_PI as c_short;
             let iff_multi_queue = IFF_MULTI_QUEUE as c_short;
+            let iff_napi = IFF_NAPI as c_short;
+            let iff_vnet_hdr = IFF_VNET_HDR as c_short;
             let packet_information = config.platform_config.packet_information;
+            let napi = config.platform_config.napi;
+            let vnet_hdr = config.platform_config.vnet_hdr;
             req.ifr_ifru.ifru_flags = device_type
                 | if packet_information { 0 } else { iff_no_pi }
+                | if napi { iff_napi } else { 0 }
+                | if vnet_hdr { iff_vnet_hdr } else { 0 }
                 | if queues_num > 1 { iff_multi_queue } else { 0 };
 
             let tun_fd = {
-                let fd = libc::open(b"/dev/net/tun\0".as_ptr() as *const _, O_RDWR);
+                let fd = libc::open(c"/dev/net/tun".as_ptr() as *const _, O_RDWR);
                 let tun_fd = Fd::new(fd, true).map_err(|_| io::Error::last_os_error())?;
 
                 if let Err(err) = tunsetiff(tun_fd.inner, &mut req as *mut _ as *mut _) {
@@ -127,9 +147,50 @@ impl Device {
 
         if config.platform_config.ensure_root_privileges {
             device.configure(config)?;
+            if let Err(error) = device.set_qdisc("pfifo_fast") {
+                log::warn!("failed to set qdisc = pfifo_fast: {:?}", error);
+            }
         }
 
         Ok(device)
+    }
+
+    fn set_qdisc(&self, qdisc: &str) -> Result<(), io::Error> {
+        let ifindex =
+            unsafe { libc::if_nametoindex(CString::new(self.tun_name.as_str())?.as_ptr()) };
+        if ifindex == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut tc_msg = TcMessage::with_index(ifindex as _);
+        tc_msg.header.parent = TC_H_ROOT.into();
+        tc_msg.attributes.push(TcAttribute::Kind(qdisc.to_string()));
+
+        let mut nl_msg = NetlinkMessage::from(RouteNetlinkMessage::NewQueueDiscipline(tc_msg));
+        nl_msg.header.flags = NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE | NLM_F_ACK;
+        nl_msg.header.sequence_number = 1;
+        nl_msg.finalize();
+
+        let mut buf = vec![0u8; nl_msg.buffer_len()];
+        nl_msg.serialize(&mut buf);
+
+        let socket = Socket::new(NETLINK_ROUTE)?;
+        socket.send_to(&buf, &SocketAddr::new(0, 0), 0)?;
+
+        let mut resp = Vec::with_capacity(4096);
+        let n = socket.recv(&mut resp, 0)?;
+
+        if let NetlinkPayload::Error(err) =
+            NetlinkMessage::<RouteNetlinkMessage>::deserialize(&resp[..n])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
+                .payload
+        {
+            if err.code.is_some() {
+                return Err(err.to_io());
+            }
+        }
+
+        Ok(())
     }
 
     /// Prepare a new request.
@@ -180,21 +241,6 @@ impl Device {
     /// Split the interface into a `Reader` and `Writer`.
     pub fn split(self) -> (posix::Reader, posix::Writer) {
         (self.tun.reader, self.tun.writer)
-    }
-
-    /// Set non-blocking mode
-    pub fn set_nonblock(&self) -> io::Result<()> {
-        self.tun.set_nonblock()
-    }
-
-    /// Recv a packet from tun device
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.tun.recv(buf)
-    }
-
-    /// Send a packet to tun device
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.tun.send(buf)
     }
 }
 

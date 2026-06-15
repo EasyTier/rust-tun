@@ -12,10 +12,15 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
+use crate::platform::posix::split::io::IoSlice;
+use crate::platform::posix::split::io::IoSliceMut;
 use crate::platform::posix::Fd;
+use crate::utils::SliceExt;
 use crate::PACKET_INFORMATION_LENGTH as PIL;
-use bytes::BufMut;
+use delegate::delegate;
+use smallvec::SmallVec;
 use std::io::{self, Read, Write};
+use std::iter;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 use std::sync::Arc;
 
@@ -32,94 +37,94 @@ pub(crate) fn is_ipv6(buf: &[u8]) -> std::io::Result<bool> {
     }
 }
 
-pub(crate) fn generate_packet_information(
-    _packet_information: bool,
-    _ipv6: bool,
-) -> Option<[u8; PIL]> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const TUN_PROTO_IP6: [u8; PIL] = (libc::ETH_P_IPV6 as u32).to_be_bytes();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const TUN_PROTO_IP4: [u8; PIL] = (libc::ETH_P_IP as u32).to_be_bytes();
-
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    const TUN_PROTO_IP6: [u8; PIL] = (libc::AF_INET6 as u32).to_be_bytes();
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    const TUN_PROTO_IP4: [u8; PIL] = (libc::AF_INET as u32).to_be_bytes();
-
-    // FIXME: Currently, the FreeBSD we test (FreeBSD-14.0-RELEASE) seems to have no PI. Here just a dummy.
-    #[cfg(target_os = "freebsd")]
-    const TUN_PROTO_IP6: [u8; PIL] = 0x86DD_u32.to_be_bytes();
-    #[cfg(target_os = "freebsd")]
-    const TUN_PROTO_IP4: [u8; PIL] = 0x0800_u32.to_be_bytes();
-
-    #[cfg(unix)]
-    if _packet_information {
-        if _ipv6 {
-            return Some(TUN_PROTO_IP6);
-        } else {
-            return Some(TUN_PROTO_IP4);
+pub(crate) const fn packet_information(ipv6: bool) -> [u8; PIL] {
+    cfg_select! {
+        any(target_os = "linux", target_os = "android") => {
+            const TUN_PROTO_IP6: [u8; PIL] = (libc::ETH_P_IPV6 as u32).to_be_bytes();
+            const TUN_PROTO_IP4: [u8; PIL] = (libc::ETH_P_IP as u32).to_be_bytes();
+        }
+        any(target_os = "macos", target_os = "ios") => {
+            const TUN_PROTO_IP6: [u8; PIL] = (libc::AF_INET6 as u32).to_be_bytes();
+            const TUN_PROTO_IP4: [u8; PIL] = (libc::AF_INET as u32).to_be_bytes();
+        }
+        // FIXME: Currently, the FreeBSD we test (FreeBSD-14.0-RELEASE) seems to have no PI. Here just a dummy.
+        target_os = "freebsd" => {
+            const TUN_PROTO_IP6: [u8; PIL] = 0x86DD_u32.to_be_bytes();
+            const TUN_PROTO_IP4: [u8; PIL] = 0x0800_u32.to_be_bytes();
         }
     }
-    None
+
+    if ipv6 {
+        TUN_PROTO_IP6
+    } else {
+        TUN_PROTO_IP4
+    }
 }
 
 /// Read-only end for a file descriptor.
 pub struct Reader {
     pub(crate) fd: Arc<Fd>,
     pub(crate) offset: usize,
-    pub(crate) buf: Vec<u8>,
     pub(crate) mtu: u16,
 }
 
 impl Reader {
     pub(crate) fn set_mtu(&mut self, value: u16) {
         self.mtu = value;
-        self.buf.resize(value as usize + self.offset, 0);
     }
 
-    pub(crate) fn recv(&self, mut in_buf: &mut [u8]) -> io::Result<usize> {
-        const STACK_BUF_LEN: usize = crate::DEFAULT_MTU as usize + PIL;
-        let in_buf_len = in_buf.len() + self.offset;
+    pub(crate) fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.offset == 0 {
+            return self.fd.read(buf);
+        }
 
-        let mut helper = |local_buf: &mut [u8]| {
-            let either_buf = if self.offset != 0 {
-                &mut *local_buf
-            } else {
-                &mut *in_buf
-            };
-            let amount = self.fd.read(either_buf)?;
-            if self.offset != 0 {
-                in_buf.put_slice(&local_buf[self.offset..amount]);
-            }
-            Ok(amount - self.offset)
-        };
-        // The following logic is to prevent dynamically allocating Vec on every recv
-        // As long as the MTU is set to value lesser than 1500, this api uses `stack_buf`
-        // and avoids `Vec` allocation
-        if in_buf_len > STACK_BUF_LEN && self.offset != 0 {
-            helper(&mut vec![0u8; in_buf_len][..])
+        let mut header = [0u8; PIL];
+
+        let amount = self.fd.readv(&mut [
+            IoSliceMut::new(&mut header[..self.offset]),
+            IoSliceMut::new(buf),
+        ])?;
+
+        if amount <= self.offset {
+            Ok(0)
         } else {
-            helper(&mut [0u8; STACK_BUF_LEN])
+            Ok(amount - self.offset)
+        }
+    }
+
+    pub(crate) fn recv_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+        if self.offset == 0 {
+            return self.fd.readv(bufs);
+        }
+
+        let mut header = [0u8; PIL];
+
+        let mut bufs = iter::once(IoSliceMut::new(&mut header[..self.offset]))
+            .chain(
+                bufs.iter_mut()
+                    .filter(|b| !b.is_empty())
+                    .map(|buf| IoSliceMut::new(buf)),
+            )
+            .collect::<SmallVec<[IoSliceMut<'_>; 32]>>();
+
+        let amount = self.fd.readv(&mut bufs)?;
+
+        if amount <= self.offset {
+            Ok(0)
+        } else {
+            Ok(amount - self.offset)
         }
     }
 }
 
 impl Read for Reader {
-    fn read(&mut self, mut buf: &mut [u8]) -> io::Result<usize> {
-        let either_buf = if self.offset != 0 {
-            let len = buf.len() + self.offset;
-            if len > self.buf.len() {
-                self.buf.resize(len, 0_u8);
-            }
-            &mut self.buf[..len]
-        } else {
-            &mut *buf
-        };
-        let amount = self.fd.read(either_buf)?;
-        if self.offset != 0 {
-            buf.put_slice(&self.buf[self.offset..amount]);
+    delegate! {
+        to self {
+            #[call(recv)]
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+            #[call(recv_vectored)]
+            fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize>;
         }
-        Ok(amount - self.offset)
     }
 }
 
@@ -133,68 +138,53 @@ impl AsRawFd for Reader {
 pub struct Writer {
     pub(crate) fd: Arc<Fd>,
     pub(crate) offset: usize,
-    pub(crate) buf: Vec<u8>,
     pub(crate) mtu: u16,
 }
 
 impl Writer {
     pub(crate) fn set_mtu(&mut self, value: u16) {
         self.mtu = value;
-        self.buf.resize(value as usize + self.offset, 0);
     }
 
-    pub(crate) fn send(&self, in_buf: &[u8]) -> io::Result<usize> {
-        const STACK_BUF_LEN: usize = crate::DEFAULT_MTU as usize + PIL;
-        let in_buf_len = in_buf.len() + self.offset;
-
-        let helper = |local_buf: &mut [u8]| {
-            let either_buf = if self.offset != 0 {
-                let ipv6 = is_ipv6(in_buf)?;
-                if let Some(header) = generate_packet_information(true, ipv6) {
-                    (&mut local_buf[..self.offset]).put_slice(header.as_ref());
-                    (&mut local_buf[self.offset..in_buf_len]).put_slice(in_buf);
-                    local_buf
-                } else {
-                    in_buf
-                }
-            } else {
-                in_buf
-            };
-            let amount = self.fd.write(either_buf)?;
-            Ok(amount - self.offset)
-        };
-
-        // The following logic is to prevent dynamically allocating Vec on every send
-        // As long as the MTU is set to value lesser than 1500, this api uses `stack_buf`
-        // and avoids `Vec` allocation
-        if in_buf_len > STACK_BUF_LEN && self.offset != 0 {
-            helper(&mut vec![0_u8; in_buf_len][..])
-        } else {
-            helper(&mut [0_u8; STACK_BUF_LEN])
+    pub(crate) fn send(&self, buf: &[u8]) -> io::Result<()> {
+        if self.offset == 0 {
+            return self.fd.write(buf);
         }
+
+        let header = packet_information(is_ipv6(buf)?);
+
+        self.fd
+            .writev(&[IoSlice::new(&header[..self.offset]), IoSlice::new(buf)])
+    }
+
+    pub(crate) fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<()> {
+        if self.offset == 0 {
+            return self.fd.writev(bufs);
+        }
+
+        let mut bufs = bufs.iter().filter(|b| !b.is_empty()).copied().peekable();
+
+        let Some(first) = bufs.peek() else {
+            return Ok(());
+        };
+        let header = packet_information(is_ipv6(first)?);
+        let header = IoSlice::new(&header[..self.offset]);
+
+        let bufs = iter::once(header)
+            .chain(bufs)
+            .collect::<SmallVec<[IoSlice<'_>; 32]>>();
+
+        self.fd.writev(&bufs)
     }
 }
 
 impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let buf = if self.offset != 0 {
-            let ipv6 = is_ipv6(buf)?;
-            if let Some(header) = generate_packet_information(true, ipv6) {
-                let len = self.offset + buf.len();
-                if len > self.buf.len() {
-                    self.buf.resize(len, 0_u8);
-                }
-                (&mut self.buf[..self.offset]).put_slice(header.as_ref());
-                (&mut self.buf[self.offset..len]).put_slice(buf);
-                &self.buf[..len]
-            } else {
-                buf
-            }
-        } else {
-            buf
-        };
-        let amount = self.fd.write(buf)?;
-        Ok(amount - self.offset)
+        self.send(buf).map(|_| buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        self.send_vectored(bufs).map(|_| bufs.size())
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -211,6 +201,7 @@ impl AsRawFd for Writer {
 pub struct Tun {
     pub(crate) reader: Reader,
     pub(crate) writer: Writer,
+    pub(crate) fd: Arc<Fd>,
     pub(crate) mtu: u16,
     pub(crate) packet_information: bool,
 }
@@ -223,15 +214,14 @@ impl Tun {
             reader: Reader {
                 fd: fd.clone(),
                 offset,
-                buf: vec![0; mtu as usize + offset],
                 mtu,
             },
             writer: Writer {
-                fd,
+                fd: fd.clone(),
                 offset,
-                buf: vec![0; mtu as usize + offset],
                 mtu,
             },
+            fd,
             mtu,
             packet_information,
         }
@@ -255,42 +245,49 @@ impl Tun {
         self.packet_information
     }
 
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.reader.recv(buf)
-    }
-
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.send(buf)
+    delegate! {
+        to self.reader {
+            pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+            pub fn recv_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize>;
+        }
+        to self.writer {
+            pub fn send(&self, buf: &[u8]) -> io::Result<()>;
+            pub fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<()>;
+        }
     }
 }
 
 impl Read for Tun {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.reader.read(buf)
+    delegate! {
+        to self.reader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+            fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize>;
+        }
     }
 }
 
 impl Write for Tun {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.writer.write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.writer.flush()
+    delegate! {
+        to self.writer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize>;
+            fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize>;
+            fn flush(&mut self) -> io::Result<()>;
+        }
     }
 }
 
 impl AsRawFd for Tun {
-    fn as_raw_fd(&self) -> RawFd {
-        self.reader.as_raw_fd()
+    delegate! {
+        to self.fd {
+            fn as_raw_fd(&self) -> RawFd;
+        }
     }
 }
 
 impl IntoRawFd for Tun {
     fn into_raw_fd(self) -> RawFd {
-        drop(self.writer);
+        let Self { fd, .. } = self;
         // guarantee fd is the unique owner such that Arc::into_inner can return some
-        let fd = Arc::into_inner(self.reader.fd).unwrap(); // panic if accident
-        fd.into_raw_fd()
+        Arc::into_inner(fd).unwrap().into_raw_fd() // panic if accident
     }
 }
