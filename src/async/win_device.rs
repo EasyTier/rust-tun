@@ -106,7 +106,7 @@ impl AsyncWrite for AsyncDevice {
 struct WinSession {
     session: std::sync::Arc<wintun::Session>,
     receiver: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    _task: std::thread::JoinHandle<()>,
+    task: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WinSession {
@@ -116,8 +116,7 @@ impl WinSession {
         let task = std::thread::spawn(move || loop {
             match session_reader.receive_blocking() {
                 Ok(packet) => {
-                    if let Err(err) = receiver_tx.send(packet.bytes().to_vec()) {
-                        log::error!("{}", err);
+                    if receiver_tx.send(packet.bytes().to_vec()).is_err() {
                         break;
                     }
                 }
@@ -131,8 +130,25 @@ impl WinSession {
         Ok(WinSession {
             session,
             receiver: receiver_rx,
-            _task: task,
+            task: Some(task),
         })
+    }
+}
+
+impl Drop for WinSession {
+    fn drop(&mut self) {
+        // Stop forwarding queued packets and wake a reader blocked on an empty ring.
+        self.receiver.close();
+        if let Err(err) = self.session.shutdown() {
+            log::error!("failed to shutdown session: {:?}", err);
+        }
+        // The reader owns a session reference. Join it before returning so the
+        // adapter is released before another device with the same name is opened.
+        if let Some(task) = self.task.take() {
+            if let Err(err) = task.join() {
+                log::error!("failed to join session reader: {:?}", err);
+            }
+        }
     }
 }
 
@@ -170,5 +186,42 @@ impl AsyncWrite for WinSession {
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AsyncDevice;
+    use crate::{Configuration, Layer};
+    use std::{sync::Arc, time::Duration};
+
+    // Run as Administrator with wintun.dll beside the test executable.
+    #[test]
+    #[ignore = "requires Administrator privileges and wintun.dll"]
+    fn recreate_async_device_while_another_device_is_running() {
+        let mut config = Configuration::default();
+        config.layer(Layer::L3).tun_name("tun-test-recreate");
+        config.platform_config(|config| {
+            config.skip_config(true);
+            config.ring_cap(Some(config.min_ring_cap()));
+            config.device_guid(0x8bdb7622_88bc_42fd_b7ee_dc7704c746da);
+        });
+
+        let mut other_config = config.clone();
+        other_config.tun_name("tun-test-running");
+        other_config.platform_config(|config| {
+            config.device_guid(0x7a0c7f82_32c9_4c04_9680_cfc44fdc2136);
+        });
+        let other = AsyncDevice::new(crate::create(&other_config).unwrap()).unwrap();
+
+        for _ in 0..100 {
+            let device = AsyncDevice::new(crate::create(&config).unwrap()).unwrap();
+            let session = Arc::downgrade(&device.inner.tun.get_session());
+            // Give the worker a chance to enter receive_blocking before closing.
+            std::thread::sleep(Duration::from_millis(5));
+            drop(device);
+            assert!(session.upgrade().is_none(), "reader retained the session");
+            assert!(!other.session.task.as_ref().unwrap().is_finished());
+        }
     }
 }
