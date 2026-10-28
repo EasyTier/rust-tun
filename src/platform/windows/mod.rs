@@ -15,6 +15,7 @@
 //! Windows specific functionality.
 
 mod device;
+mod device_cleanup;
 mod verify_dll_file;
 
 use crate::configuration::Configuration;

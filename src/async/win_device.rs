@@ -193,7 +193,32 @@ impl AsyncWrite for WinSession {
 mod tests {
     use super::AsyncDevice;
     use crate::{Configuration, Layer};
-    use std::{sync::Arc, time::Duration};
+    use packet::{ip, udp, Packet};
+    use std::{
+        net::UdpSocket,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    #[ignore = "requires Administrator privileges and wintun.dll"]
+    fn opened_adapter_must_match_requested_guid() {
+        let mut config = Configuration::default();
+        config.layer(Layer::L3).tun_name("tun-test-guid-match");
+        config.platform_config(|config| {
+            config.skip_config(true);
+            config.device_guid(0x9e917113_6d4d_4e03_b112_b10d70a251bb);
+        });
+        let first = crate::create(&config).unwrap();
+        let error = crate::create(&config).err().unwrap().to_string();
+        assert!(!error.contains("different GUID"), "{error}");
+        config.platform_config(|config| {
+            config.device_guid(0xe5782c6c_e108_4313_89bd_473226cb38f4);
+        });
+        let error = crate::create(&config).err().unwrap().to_string();
+        assert!(error.contains("different GUID"), "{error}");
+        drop(first);
+    }
 
     // Run as Administrator with wintun.dll beside the test executable.
     #[test]
@@ -208,11 +233,15 @@ mod tests {
         });
 
         let mut other_config = config.clone();
-        other_config.tun_name("tun-test-running");
+        other_config
+            .tun_name("tun-test-running")
+            .address((192, 0, 2, 1))
+            .netmask((255, 255, 255, 0));
         other_config.platform_config(|config| {
+            config.skip_config(false);
             config.device_guid(0x7a0c7f82_32c9_4c04_9680_cfc44fdc2136);
         });
-        let other = AsyncDevice::new(crate::create(&other_config).unwrap()).unwrap();
+        let mut other = AsyncDevice::new(crate::create(&other_config).unwrap()).unwrap();
 
         for _ in 0..100 {
             let device = AsyncDevice::new(crate::create(&config).unwrap()).unwrap();
@@ -222,6 +251,33 @@ mod tests {
             drop(device);
             assert!(session.upgrade().is_none(), "reader retained the session");
             assert!(!other.session.task.as_ref().unwrap().is_finished());
+        }
+
+        let payload = b"other adapter read probe";
+        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        assert_eq!(
+            socket.send_to(payload, "192.0.2.2:9").unwrap(),
+            payload.len()
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(packet) = other.session.receiver.try_recv() {
+                let Ok(ip::Packet::V4(ip_packet)) = ip::Packet::new(packet.as_slice()) else {
+                    continue;
+                };
+                let Ok(udp_packet) = udp::Packet::new(ip_packet.payload()) else {
+                    continue;
+                };
+                if udp_packet.destination() == 9 && udp_packet.payload() == payload {
+                    println!("received other adapter UDP probe: {} bytes", packet.len());
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "other adapter did not receive the UDP probe"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }

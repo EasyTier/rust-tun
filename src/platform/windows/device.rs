@@ -51,9 +51,32 @@ impl Device {
         };
         let tun_name = config.tun_name.as_deref().unwrap_or("wintun");
         let guid = config.platform_config.device_guid;
-        let adapter = match wintun::Adapter::open(&wintun, tun_name) {
-            Ok(a) => a,
-            Err(_) => wintun::Adapter::create(&wintun, tun_name, tun_name, guid)?,
+        let open_adapter = || -> Result<Option<Arc<wintun::Adapter>>> {
+            let adapter = match wintun::Adapter::open(&wintun, tun_name) {
+                Ok(adapter) => adapter,
+                Err(_) => return Ok(None),
+            };
+            if let Some(guid) = guid {
+                let requested = windows_sys::core::GUID::from_u128(guid);
+                let actual = adapter.get_guid().to_ne_bytes();
+                if actual[..4] != requested.data1.to_ne_bytes()
+                    || actual[4..6] != requested.data2.to_ne_bytes()
+                    || actual[6..8] != requested.data3.to_ne_bytes()
+                    || actual[8..] != requested.data4
+                {
+                    return Err(format!("Wintun adapter {tun_name} has a different GUID").into());
+                }
+            }
+            Ok(Some(adapter))
+        };
+        let adapter = match open_adapter()? {
+            Some(a) => a,
+            None => {
+                if let Some(guid) = guid {
+                    super::device_cleanup::wait_for_stale_device(guid)?;
+                }
+                wintun::Adapter::create(&wintun, tun_name, tun_name, guid)?
+            }
         };
 
         // on win7 guid will not be correctly assigned, user should skip the config step.
