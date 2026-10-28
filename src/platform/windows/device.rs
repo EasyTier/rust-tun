@@ -51,6 +51,9 @@ impl Device {
         };
         let tun_name = config.tun_name.as_deref().unwrap_or("wintun");
         let guid = config.platform_config.device_guid;
+        if let Some(guid) = guid {
+            super::device_cleanup::cleanup_stale_device(guid)?;
+        }
         let adapter = match wintun::Adapter::open(&wintun, tun_name) {
             Ok(a) => a,
             Err(_) => wintun::Adapter::create(&wintun, tun_name, tun_name, guid)?,
