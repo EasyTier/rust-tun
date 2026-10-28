@@ -1,4 +1,17 @@
-use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
+use std::{
+    io,
+    mem::size_of,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Devices::DeviceAndDriverInstallation::*,
+    Foundation::{GetLastError, ERROR_IN_WOW64},
+};
+
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, PartialEq, Eq)]
 enum DeviceAction {
@@ -32,6 +45,141 @@ fn device_instance_id(guid: u128) -> String {
     )
 }
 
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn locate_device(instance_id: &str) -> crate::error::Result<Option<(u32, u32, u32)>> {
+    let instance_id = wide(instance_id);
+    let mut dev_inst = 0;
+    let result = unsafe {
+        CM_Locate_DevNodeW(
+            &mut dev_inst,
+            instance_id.as_ptr(),
+            CM_LOCATE_DEVNODE_PHANTOM,
+        )
+    };
+    match result {
+        CR_SUCCESS => {}
+        CR_NO_SUCH_DEVNODE => return Ok(None),
+        _ => return Err(format!("CM_Locate_DevNodeW failed with CONFIGRET {result}").into()),
+    }
+
+    let mut status = 0;
+    let mut problem = 0;
+    let result = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) };
+    if result != CR_SUCCESS {
+        return Err(format!("CM_Get_DevNode_Status failed with CONFIGRET {result}").into());
+    }
+    Ok(Some((dev_inst, status, problem)))
+}
+
+struct DeviceInfoSet(HDEVINFO);
+
+impl Drop for DeviceInfoSet {
+    fn drop(&mut self) {
+        unsafe { SetupDiDestroyDeviceInfoList(self.0) };
+    }
+}
+
+fn remove_device_wow64(instance_id: &str) -> crate::error::Result<()> {
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let pnputil = Path::new(&root).join("Sysnative").join("pnputil.exe");
+    let status = std::process::Command::new(pnputil)
+        .arg("/remove-device")
+        .arg(instance_id)
+        .status()?;
+    if !status.success() {
+        return Err(format!("pnputil /remove-device failed with {status}").into());
+    }
+    Ok(())
+}
+
+fn remove_device(instance_id: &str) -> crate::error::Result<()> {
+    let instance_id_wide = wide(instance_id);
+    let dev_info = unsafe {
+        SetupDiCreateDeviceInfoListExW(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if dev_info == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let dev_info = DeviceInfoSet(dev_info);
+
+    let mut data: SP_DEVINFO_DATA = unsafe { std::mem::zeroed() };
+    data.cbSize = size_of::<SP_DEVINFO_DATA>() as u32;
+    if unsafe {
+        SetupDiOpenDeviceInfoW(
+            dev_info.0,
+            instance_id_wide.as_ptr(),
+            std::ptr::null_mut(),
+            DIOD_INHERIT_CLASSDRVS,
+            &mut data,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+
+    let mut params: SP_REMOVEDEVICE_PARAMS = unsafe { std::mem::zeroed() };
+    params.ClassInstallHeader.cbSize = size_of::<SP_CLASSINSTALL_HEADER>() as u32;
+    params.ClassInstallHeader.InstallFunction = DIF_REMOVE;
+    params.Scope = DI_REMOVEDEVICE_GLOBAL;
+    if unsafe {
+        SetupDiSetClassInstallParamsW(
+            dev_info.0,
+            &data,
+            &params.ClassInstallHeader,
+            size_of::<SP_REMOVEDEVICE_PARAMS>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    if unsafe { SetupDiCallClassInstaller(DIF_REMOVE, dev_info.0, &data) } == 0 {
+        let error = unsafe { GetLastError() };
+        if error == ERROR_IN_WOW64 {
+            return remove_device_wow64(instance_id);
+        }
+        return Err(io::Error::from_raw_os_error(error as i32).into());
+    }
+    Ok(())
+}
+
+pub(super) fn cleanup_stale_device(guid: u128) -> crate::error::Result<bool> {
+    let instance_id = device_instance_id(guid);
+    let Some((_, status, problem)) = locate_device(&instance_id)? else {
+        return Ok(false);
+    };
+    if classify_device(status, problem) != DeviceAction::Remove {
+        return Ok(false);
+    }
+
+    let started = Instant::now();
+    remove_device(&instance_id)?;
+    let deadline = started + CLEANUP_TIMEOUT;
+    loop {
+        match locate_device(&instance_id)? {
+            None => break,
+            Some((_, status, _)) if status & DN_HAS_PROBLEM == 0 => break,
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out removing stale Wintun device {instance_id}").into());
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+    log::info!(
+        "removed stale Wintun device {instance_id} in {:?}",
+        started.elapsed()
+    );
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +209,10 @@ mod tests {
         ] {
             assert_eq!(classify_device(status, problem), DeviceAction::Leave);
         }
+    }
+
+    #[test]
+    fn missing_requested_identity_is_not_an_error() {
+        assert_eq!(cleanup_stale_device(u128::MAX).unwrap(), false);
     }
 }
