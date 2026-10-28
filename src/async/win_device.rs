@@ -200,6 +200,26 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[test]
+    #[ignore = "requires Administrator privileges and wintun.dll"]
+    fn opened_adapter_must_match_requested_guid() {
+        let mut config = Configuration::default();
+        config.layer(Layer::L3).tun_name("tun-test-guid-match");
+        config.platform_config(|config| {
+            config.skip_config(true);
+            config.device_guid(0x9e917113_6d4d_4e03_b112_b10d70a251bb);
+        });
+        let first = crate::create(&config).unwrap();
+        let error = crate::create(&config).err().unwrap().to_string();
+        assert!(!error.contains("different GUID"), "{error}");
+        config.platform_config(|config| {
+            config.device_guid(0xe5782c6c_e108_4313_89bd_473226cb38f4);
+        });
+        let error = crate::create(&config).err().unwrap().to_string();
+        assert!(error.contains("different GUID"), "{error}");
+        drop(first);
+    }
+
     // Run as Administrator with wintun.dll beside the test executable.
     #[test]
     #[ignore = "requires Administrator privileges and wintun.dll"]
