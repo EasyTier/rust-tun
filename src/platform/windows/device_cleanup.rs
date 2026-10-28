@@ -183,7 +183,7 @@ pub(super) fn cleanup_stale_device(guid: u128) -> crate::error::Result<bool> {
     loop {
         match locate_device(&instance_id)? {
             None => break,
-            Some((_, status, _)) if status & DN_HAS_PROBLEM == 0 => break,
+            Some((_, status, _)) if status & DN_STARTED != 0 => break,
             _ => {}
         }
         if Instant::now() >= deadline {
