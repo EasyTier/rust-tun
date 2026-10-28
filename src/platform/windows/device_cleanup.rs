@@ -70,7 +70,23 @@ fn locate_device(instance_id: &str) -> crate::error::Result<Option<(u32, u32, u3
     let result = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, dev_inst, 0) };
     match result {
         CR_SUCCESS => {}
-        CR_NO_SUCH_DEVNODE => return Ok(None),
+        CR_NO_SUCH_DEVNODE => {
+            let mut present_dev_inst = 0;
+            let present_result =
+                unsafe { CM_Locate_DevNodeW(&mut present_dev_inst, instance_id.as_ptr(), 0) };
+            match present_result {
+                CR_SUCCESS => return Ok(None),
+                CR_NO_SUCH_DEVNODE => {
+                    return Ok(Some((dev_inst, DN_HAS_PROBLEM, CM_PROB_PHANTOM)));
+                }
+                _ => {
+                    return Err(format!(
+                        "CM_Locate_DevNodeW failed with CONFIGRET {present_result}"
+                    )
+                    .into());
+                }
+            }
+        }
         _ => return Err(format!("CM_Get_DevNode_Status failed with CONFIGRET {result}").into()),
     }
     Ok(Some((dev_inst, status, problem)))
