@@ -50,8 +50,14 @@ impl Device {
             wintun::load_from_library(wintun)?
         };
         let tun_name = config.tun_name.as_deref().unwrap_or("wintun");
-        let guid = config.platform_config.device_guid;
+        let supports_guid = super::supports_requested_guid()?;
+        let guid = config.platform_config.device_guid.filter(|_| supports_guid);
         let open_adapter = || -> Result<Option<Arc<wintun::Adapter>>> {
+            if !supports_guid && config.platform_config.device_guid.is_some() {
+                // Legacy adapters cannot retain the requested GUID. Create a
+                // fresh adapter instead of reopening one owned by an old process.
+                return Ok(None);
+            }
             let adapter = match wintun::Adapter::open(&wintun, tun_name) {
                 Ok(adapter) => adapter,
                 Err(_) => return Ok(None),

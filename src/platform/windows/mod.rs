@@ -26,6 +26,21 @@ use std::net::IpAddr;
 
 pub(crate) const WINTUN_PROVIDER: &str = "WireGuard LLC";
 
+fn supports_requested_guid() -> Result<bool> {
+    use windows_sys::{
+        Wdk::System::SystemServices::RtlGetVersion,
+        Win32::System::SystemInformation::OSVERSIONINFOW,
+    };
+
+    let mut version: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
+    version.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status != 0 {
+        return Err(format!("RtlGetVersion failed with NTSTATUS {status:#x}").into());
+    }
+    Ok(version.dwMajorVersion >= 10)
+}
+
 /// Windows-only interface configuration.
 #[derive(Clone, Debug)]
 pub struct PlatformConfig {
@@ -51,6 +66,8 @@ impl Default for PlatformConfig {
 }
 
 impl PlatformConfig {
+    /// Request a fixed interface GUID on Windows 10 and later.
+    /// Wintun chooses the interface GUID on older Windows versions.
     pub fn device_guid(&mut self, device_guid: u128) {
         log::trace!("Windows configuration device GUID");
         self.device_guid = Some(device_guid);
